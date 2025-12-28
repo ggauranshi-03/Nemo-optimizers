@@ -12,40 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
 from typing import Optional
 
 import lightning.pytorch as pl
 import nemo_run as run
 import torch
+import torch.nn as nn
+from torch.optim.optimizer import Optimizer
 
+# NeMo and Megatron Imports
 from nemo.collections.llm.api import pretrain
 from nemo.collections.llm.gpt.data.mock import MockDataModule
 from nemo.collections.llm.recipes.log.default import default_log, default_resume, tensorboard_logger
 from nemo.collections.llm.recipes.nemotron import nemotron_model, nemotron_trainer
-from nemo.collections.llm.recipes.optim.adam import distributed_fused_adam_with_cosine_annealing
-from nemo.collections.llm.recipes.optim.yogi import distributed_yogi_with_cosine_annealing
 from nemo.utils.exp_manager import TimingCallback
+from nemo.collections.llm.recipes.optim.yogi import distributed_fused_yogi_with_cosine_annealing
 
+
+
+# -------------------------------------------------------------------------
+# 4. Main Recipe Definitions
+# -------------------------------------------------------------------------
 NAME = "nemotron3_22b_16k"
-
 
 @run.cli.factory(name=NAME)
 def model() -> run.Config[pl.LightningModule]:
     """
     Factory function to create a Nemotron3 22B model with 16k sequence length.
-
-    Returns:
-        run.Config[pl.LightningModule]: Configuration for the Nemotron3 22b and 16k sequence length model.
-
-    Examples:
-        CLI usage:
-            $ nemo llm pretrain model=nemotron3_22b_16k ...
-
-        Python API usage:
-            >>> model_config = model()
-            >>> print(model_config)
     """
-
     return nemotron_model(version=NAME)
 
 
@@ -85,52 +80,7 @@ def pretrain_recipe(
 ) -> run.Partial:
     """
     Create a pre-training recipe for Nemotron3 22B model with 16k sequence length.
-
-    This function sets up a complete configuration for pre-training, including
-    model, trainer, data, logging, optimization, and resumption settings.
-
-    Args:
-        dir (Optional[str]): Directory for saving logs and checkpoints.
-        name (str): Name of the pre-training run.
-        tensor_parallelism (int): Degree of tensor model parallelism.
-        pipeline_parallelism (int): Degree of pipeline model parallelism.
-        pipeline_parallelism_type (Optional[torch.dtype]): Data type for pipeline parallelism.
-        virtual_pipeline_parallelism (Optional[int]): Size of virtual pipeline parallelism.
-        context_parallelism (int): Degree of context parallelism.
-        sequence_parallelism (bool): Whether to use sequence parallelism.
-        num_nodes (int): Number of compute nodes to use.
-        num_gpus_per_node (int): Number of GPUs per node.
-        max_steps (int): Maximum number of training steps.
-        precision (str): Precision configuration, one of fp32, 16-mixed or bf16-mixed.
-        accumulate_grad_batches (int): Number of steps per gradient accumulation.
-        gradient_clip_val (float): Value for gradient clipping.
-        limit_test_batches (int): Limit the number of test batches.
-        limit_val_batches (int): Limit the number of validation batches.
-        log_every_n_steps (int): Log every n steps.
-        val_check_interval (int): Run validation every N steps.
-        global_batch_size (int): Global batch size.
-        micro_batch_size (int): Micro batch size.
-        seq_length (int): Sequence length.
-        warmup_steps (int): Number of warmup steps.
-        constant_steps (int): Number of constant steps.
-        min_lr (float): Minimum learning rate.
-        max_lr (float): Maximum learning rate.
-        fn (Callable): The pre-training function to use.
-
-    Returns:
-        run.Partial: Partial configuration for pre-training.
-
-    Examples:
-        CLI usage:
-            $ nemo llm pretrain --factory nemotron3_22b_16k
-            $ nemo llm pretrain --factory "nemotron3_22b_16k(num_nodes=1, name='my_nemotron_pretrain')"
-
-        Python API usage:
-            >>> recipe = pretrain_recipe(name="nemotron_pretrain", num_nodes=1)
-            >>> print(recipe)
-
-    Note:
-        This recipe uses a mock dataset, look for the finetune examples to see how to change the dataset.
+    Now using distributed_fused_yogi_with_cosine_annealing.
     """
     return run.Partial(
         fn,
@@ -160,7 +110,8 @@ def pretrain_recipe(
             micro_batch_size=micro_batch_size,
         ),
         log=default_log(dir=dir, name=name, tensorboard_logger=tensorboard_logger(name=name)),
-        optim=distributed_yogi_with_cosine_annealing(
+        # CHANGED: Swapped Adam for Yogi
+        optim=distributed_fused_yogi_with_cosine_annealing(
             precision=precision,
             warmup_steps=warmup_steps,
             constant_steps=constant_steps,
