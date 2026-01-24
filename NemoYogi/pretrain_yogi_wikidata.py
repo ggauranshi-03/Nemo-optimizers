@@ -12,7 +12,7 @@ from nemo import lightning as nl
 from nemo.collections import llm
 from nemo.collections.common.tokenizers.huggingface.auto_tokenizer import AutoTokenizer
 from nemo.collections.llm.gpt.data import PreTrainingDataModule
-
+from nemo.lightning.pytorch.optim import OptimizerModule
 # --- REAL IMPORTS from PyTorch Lightning ---
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import ModelCheckpoint, Callback
@@ -46,7 +46,7 @@ class Yogi(Optimizer):
         params,
         lr: float = 1e-2,
         betas: tuple = (0.9, 0.999),
-        eps: float = 1e-3,
+        eps: float = 1e-8,
         weight_decay: float = 0.0,
     ):
         if lr < 0.0:
@@ -114,7 +114,35 @@ class Yogi(Optimizer):
 
         return loss
 
+# ============================================================================ #
+#                           Yogi Module Wrapper                                #
+# ============================================================================ #
+class YogiOptimizerModule(OptimizerModule):
+    """
+    Wraps the custom Yogi optimizer to make it compatible with NeMo's
+    OptimizerModule interface.
+    """
+    def __init__(self, lr: float, betas: tuple, weight_decay: float, lr_scheduler=None):
+        super().__init__(lr_scheduler=lr_scheduler)
+        
+        # FIX 1: Add the missing config attribute to satisfy NeMo checks
+        self.config = None 
+        
+        self.lr = lr
+        self.betas = betas
+        self.weight_decay = weight_decay
 
+    def optimizers(self, model):
+        """
+        This method is called by NeMo to instantiate the actual optimizer.
+        """
+        # FIX 2: Return a LIST of optimizers [ ... ], not a single object
+        return [Yogi(
+            model.parameters(),
+            lr=self.lr,
+            betas=self.betas,
+            weight_decay=self.weight_decay
+        )]
 # ============================================================================ #
 #              DIAGNOSTIC CALLBACK - Verify Optimizer is Yogi                #
 # ============================================================================ #
@@ -200,9 +228,18 @@ def main():
         layernorm_epsilon=1e-5,
         make_vocab_size_divisible_by=128,
     )
+    optimizer_arg = YogiOptimizerModule(
+        lr=args.lr,
+        betas=(args.beta1, args.beta2),
+        weight_decay=args.weight_decay
+    )
     tokenizer = AutoTokenizer(pretrained_model_name="gpt2")
-    model = llm.GPTModel(config=model_config, tokenizer=tokenizer)
-
+    # model = llm.GPTModel(config=model_config, tokenizer=tokenizer)
+    model = llm.GPTModel(
+        config=model_config, 
+        tokenizer=tokenizer,
+        optim=optimizer_arg  # Inject it here
+    )
     # 2. Data Module
     data = PreTrainingDataModule(
         paths={
@@ -292,18 +329,10 @@ def main():
     # ====================================================================== #
     # CRITICAL FIX: Override trainer's optimizer_class BEFORE training       #
     # ====================================================================== #
-    def create_yogi_optimizer(param_groups):
-        """Factory function NeMo will call to create the optimizer"""
-        return Yogi(
-            param_groups,
-            lr=args.lr,
-            betas=(args.beta1, args.beta2),
-            eps=1e-3,
-            weight_decay=args.weight_decay,
-        )
+
     
-    trainer._optimizer_class = Yogi
-    print("[TRAINER] Set trainer._optimizer_class = Yogi\n")
+    # trainer._optimizer_class = Yogi
+    # print("[TRAINER] Set trainer._optimizer_class = Yogi\n")
 
     # 8. Train
     print(f"\n{'='*70}")
