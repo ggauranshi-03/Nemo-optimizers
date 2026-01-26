@@ -1,4 +1,3 @@
-
 import math
 import argparse
 import os
@@ -50,9 +49,7 @@ def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
 # ============================================================================ #
 #                            Hybrid Muon Optimizer                             #
 # ============================================================================ #
-# ============================================================================ #
-#                            Hybrid Muon Optimizer                             #
-# ============================================================================ #
+
 class Muon(Optimizer):
     def __init__(
         self,
@@ -62,7 +59,7 @@ class Muon(Optimizer):
         nesterov: bool = True,
         ns_steps: int = 5,
         adam_w_lr: float = 0.003,       
-        adam_w_betas: tuple = (0.95, 0.95),
+        adam_w_betas: tuple = (0.9, 0.999),
         weight_decay: float = 0.0,
         eps: float = 1e-8,
     ):
@@ -375,18 +372,12 @@ def main():
         pin_memory=True,
     )
 
-    # =========================================================================
-    # FIX: Restore 'ddp="megatron"' to satisfy MegatronStrategy assertions.
-    # The 'no gradients' issue is handled in the Muon optimizer class above
-    # by checking for 'main_grad' and debugging attributes.
-    # =========================================================================
     strategy = nl.MegatronStrategy(
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
         pipeline_dtype=torch.bfloat16,
-        ddp="megatron",  # <--- MUST BE 'megatron' for MegatronStrategy
-        find_unused_parameters=False, # Revert to False unless error explicitly demands it
-        # Ensure we don't use internal distributed optimizer (we use Muon)
+        ddp="megatron",  # <--- 'megatron' for MegatronStrategy
+        find_unused_parameters=False,
         use_distributed_optimizer=False,
     )
 
