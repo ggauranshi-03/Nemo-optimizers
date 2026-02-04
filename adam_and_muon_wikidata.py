@@ -1,9 +1,468 @@
+
+# import math
+# import argparse
+# from dataclasses import dataclass
+# from typing import Optional
+# import os
+
+# import torch
+# import torch.nn.functional as F
+
+# # --- Standard NeMo Imports ---
+# from nemo import lightning as nl
+# from nemo.collections import llm
+# from nemo.collections.common.tokenizers.huggingface.auto_tokenizer import AutoTokenizer
+# from nemo.collections.llm.gpt.data import PreTrainingDataModule
+# from nemo.lightning.pytorch.optim import OptimizerModule
+
+# # --- REAL IMPORTS from PyTorch Lightning ---
+# from lightning.pytorch.loggers import WandbLogger
+# from lightning.pytorch.callbacks import ModelCheckpoint, Callback
+# from torch.optim.optimizer import Optimizer
+
+
+# # ============================================================================ #
+# #                           Muon Math Helper Functions                         #
+# # ============================================================================ #
+# def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
+#     """
+#     Newton-Schulz iteration to compute the zero-power / orthogonalization.
+    
+#     COMPLETELY REWRITTEN based on original Muon paper.
+#     Reference: https://github.com/KellerJordan/Muon
+#     """
+#     assert G.ndim == 2, f"Expected 2D tensor, got {G.ndim}D"
+    
+#     # Constants for 5th order Newton-Schulz
+#     a, b, c = (3.4445, -4.7750, 2.0315)
+    
+#     # Work in the original dtype (don't force conversions)
+#     X = G / (G.norm() + eps)
+    
+#     # Perform Newton-Schulz iterations
+#     if G.size(0) > G.size(1):
+#         # Tall matrix: iterate on X @ X.T
+#         for _ in range(steps):
+#             A = X @ X.T
+#             B = b * A + c * A @ A
+#             X = a * X + B @ X
+#     else:
+#         # Wide matrix: iterate on X.T @ X
+#         for _ in range(steps):
+#             A = X.T @ X
+#             B = b * A + c * A @ A
+#             X = X @ (a * torch.eye(X.size(1), device=X.device, dtype=X.dtype) + B)
+    
+#     return X
+
+
+# # ============================================================================ #
+# #                          Hybrid Muon Optimizer                               #
+# # ============================================================================ #
+# class Muon(Optimizer):
+#     """
+#     Muon - MomentUm Orthogonalized by Newton-schulz.
+    
+#     COMPLETELY REWRITTEN with correct algorithm:
+#     - Proper Newton-Schulz for tall/wide matrices
+#     - Correct momentum application
+#     - Proper scaling based on effective rank
+#     """
+#     def __init__(
+#         self,
+#         params,
+#         lr: float = 0.02,              
+#         momentum: float = 0.95,
+#         nesterov: bool = True,
+#         ns_steps: int = 5,
+#         adam_w_lr: float = 0.003,      
+#         adam_w_betas: tuple = (0.95, 0.95),  # FIXED: Match beta1 to momentum
+#         weight_decay: float = 0.0,     # FIXED: Start with 0, add later
+#         eps: float = 1e-8,
+#     ):
+#         defaults = dict(
+#             lr=lr, 
+#             momentum=momentum, 
+#             nesterov=nesterov, 
+#             ns_steps=ns_steps,
+#             adam_w_lr=adam_w_lr,
+#             adam_w_betas=adam_w_betas,
+#             weight_decay=weight_decay,
+#             eps=eps
+#         )
+#         super().__init__(params, defaults)
+
+#     def _classify_param(self, p):
+#         """Classify parameter to use Muon or AdamW"""
+#         # Embeddings: large first dimension
+#         is_embedding = (p.ndim == 2 and p.size(0) > 10000)
+        
+#         # Norms and biases: 1D
+#         is_norm_or_bias = (p.ndim < 2)
+        
+#         # Linear weights: 2D but not embeddings
+#         is_linear_weight = (p.ndim == 2 and not is_embedding)
+        
+#         return is_linear_weight
+
+#     @torch.no_grad()
+#     def step(self, closure=None):
+#         loss = None
+#         if closure is not None:
+#             with torch.enable_grad():
+#                 loss = closure()
+
+#         for group in self.param_groups:
+#             lr = group['lr']
+#             momentum = group['momentum']
+#             nesterov = group['nesterov']
+#             ns_steps = group['ns_steps']
+#             weight_decay = group['weight_decay']
+            
+#             # AdamW params
+#             adam_lr = group['adam_w_lr']
+#             beta1, beta2 = group['adam_w_betas']
+#             eps = group['eps']
+
+#             for p in group['params']:
+#                 if p.grad is None:
+#                     continue
+                
+#                 grad = p.grad
+#                 state = self.state[p]
+
+#                 # Initialize state
+#                 if len(state) == 0:
+#                     state['step'] = 0
+#                     state['use_muon'] = self._classify_param(p)
+#                     state['momentum_buffer'] = torch.zeros_like(p)
+#                     state['exp_avg'] = torch.zeros_like(p)
+#                     state['exp_avg_sq'] = torch.zeros_like(p)
+
+#                 state['step'] += 1
+#                 use_muon = state['use_muon']
+
+#                 if use_muon:
+#                     # ================= MUON UPDATE ================= #
+#                     # CRITICAL FIX: Apply weight decay FIRST
+#                     if weight_decay != 0:
+#                         p.mul_(1 - lr * weight_decay)
+                    
+#                     # Get momentum buffer
+#                     buf = state['momentum_buffer']
+                    
+#                     # Update momentum buffer
+#                     buf.mul_(momentum).add_(grad)
+                    
+#                     # Select gradient for update
+#                     if nesterov:
+#                         g = grad.add(buf, alpha=momentum)
+#                     else:
+#                         g = buf
+                    
+#                     # CRITICAL FIX: Orthogonalize the gradient
+#                     g_ortho = zeropower_via_newtonschulz5(g, steps=ns_steps)
+                    
+#                     # CRITICAL FIX: Proper scaling
+#                     # The Newton-Schulz gives us a matrix with orthonormal columns
+#                     # We need to scale by sqrt of the effective rank
+#                     if g.size(0) >= g.size(1):
+#                         # Tall matrix: scale by sqrt(d_in / d_out)
+#                         scale = math.sqrt(g.size(1) / g.size(0))
+#                     else:
+#                         # Wide matrix: scale by sqrt(d_out / d_in)  
+#                         scale = math.sqrt(g.size(0) / g.size(1))
+                    
+#                     # Apply update
+#                     # p.add_(g_ortho, alpha=-lr * scale)
+#                     p.add_(g_ortho, alpha=-lr)
+
+#                 else:
+#                     # ================= ADAMW UPDATE ================= #
+#                     # Apply weight decay first
+#                     if weight_decay != 0:
+#                         p.mul_(1 - adam_lr * weight_decay)
+                    
+#                     exp_avg = state['exp_avg']
+#                     exp_avg_sq = state['exp_avg_sq']
+                    
+#                     # Update biased first/second moment estimates
+#                     exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+#                     exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                    
+#                     # Bias correction
+#                     bias_correction1 = 1 - beta1 ** state['step']
+#                     bias_correction2 = 1 - beta2 ** state['step']
+                    
+#                     # Compute step size
+#                     step_size = adam_lr / bias_correction1
+#                     bias_correction2_sqrt = math.sqrt(bias_correction2)
+                    
+#                     # Update parameters
+#                     denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
+#                     p.addcdiv_(exp_avg, denom, value=-step_size)
+
+#         return loss
+
+
+# # ============================================================================ #
+# #                           Muon Module Wrapper                                #
+# # ============================================================================ #
+# class MuonOptimizerModule(OptimizerModule):
+#     """
+#     Wraps the custom Muon optimizer to make it compatible with NeMo's
+#     OptimizerModule interface.
+#     """
+#     def __init__(self, lr: float, adam_w_lr: float, weight_decay: float, lr_scheduler=None):
+#         super().__init__(lr_scheduler=lr_scheduler)
+        
+#         # REQUIRED for NeMo DDP
+#         self.config = None 
+        
+#         self.lr = lr
+#         self.adam_w_lr = adam_w_lr
+#         self.weight_decay = weight_decay
+
+#     def optimizers(self, model):
+#         """
+#         Instantiates Muon with FIXED parameters.
+#         """
+#         return [Muon(
+#             model.parameters(),
+#             lr=self.lr,
+#             adam_w_lr=self.adam_w_lr,
+#             weight_decay=self.weight_decay,
+#             momentum=0.95,
+#             nesterov=True,
+#             ns_steps=5
+#         )]
+
+
+# # ============================================================================ #
+# #                           Perplexity Callback                                #
+# # ============================================================================ #
+# class PerplexityCallback(Callback):
+#     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+#         loss = None
+#         if isinstance(outputs, dict):
+#             loss = outputs.get("loss") or outputs.get("reduced_train_loss")
+#         elif torch.is_tensor(outputs):
+#             loss = outputs
+        
+#         if loss is not None:
+#             ppl = torch.exp(loss.detach())
+#             pl_module.log("train_perplexity", ppl, prog_bar=True, on_step=True, on_epoch=False)
+
+
+# # ============================================================================ #
+# #                       Diagnostic Callback                                    #
+# # ============================================================================ #
+# class OptimizerDiagnosticCallback(Callback):
+#     """Enhanced diagnostic to show parameter classification"""
+    
+#     def on_train_start(self, trainer, pl_module):
+#         for i, opt in enumerate(trainer.optimizers):
+#             opt_name = opt.__class__.__name__
+#             print(f"\n{'='*70}")
+#             print(f"[DIAGNOSTIC] Optimizer {i}: {opt_name}")
+#             print(f"  Muon LR: {opt.param_groups[0]['lr']}")
+#             print(f"  AdamW LR: {opt.param_groups[0]['adam_w_lr']}")
+#             print(f"  Weight Decay: {opt.param_groups[0]['weight_decay']}")
+#             print(f"  Momentum: {opt.param_groups[0]['momentum']}")
+            
+#             # After first step, show classification
+#             print(f"\n  Waiting for first step to classify parameters...")
+#             print(f"{'='*70}\n")
+    
+#     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+#         # Only print once after first step
+#         if batch_idx == 0:
+#             for i, opt in enumerate(trainer.optimizers):
+#                 if hasattr(opt, 'state') and len(opt.state) > 0:
+#                     muon_count = 0
+#                     adamw_count = 0
+#                     muon_params = 0
+#                     adamw_params = 0
+                    
+#                     for param in opt.param_groups[0]['params']:
+#                         if param in opt.state:
+#                             if opt.state[param].get('use_muon', False):
+#                                 muon_count += 1
+#                                 muon_params += param.numel()
+#                             else:
+#                                 adamw_count += 1
+#                                 adamw_params += param.numel()
+                    
+#                     print(f"\n{'='*70}")
+#                     print(f"[PARAMETER CLASSIFICATION]")
+#                     print(f"  Muon layers: {muon_count} ({muon_params:,} parameters)")
+#                     print(f"  AdamW layers: {adamw_count} ({adamw_params:,} parameters)")
+#                     print(f"  Total: {muon_count + adamw_count} layers")
+#                     print(f"{'='*70}\n")
+
+
+# # ============================================================================ #
+# #                               Main Function                                  #
+# # ============================================================================ #
+# def main():
+#     parser = argparse.ArgumentParser(description="NeMo GPT Pretraining with FIXED Muon Optimizer")
+    
+#     # Experiment Config
+#     parser.add_argument("--name", type=str, default="gpt_muon_fixed", help="Experiment name")
+#     parser.add_argument("--exp_dir", type=str, default="experiments", help="Experiments directory")
+    
+#     # WandB Config
+#     parser.add_argument("--wandb_project", type=str, default="nemo-gpt-muon", help="WandB Project")
+#     parser.add_argument("--wandb_offline", action="store_true", help="Run WandB offline")
+#     parser.add_argument("--enable_wandb", action="store_true", default=False)
+
+#     # Training Config
+#     parser.add_argument("--num_nodes", type=int, default=1)
+#     parser.add_argument("--num_gpus_per_node", type=int, default=2)
+#     parser.add_argument("--num_layers", type=int, default=12)
+#     parser.add_argument("--hidden_size", type=int, default=768)
+#     parser.add_argument("--num_attention_heads", type=int, default=12)
+#     parser.add_argument("--seq_length", type=int, default=2048)
+#     parser.add_argument("--max_steps", type=int, default=150)
+#     parser.add_argument("--global_batch_size", type=int, default=16)
+#     parser.add_argument("--micro_batch_size", type=int, default=1)
+    
+#     # Optimizer Config - CRITICAL FIXES
+#     parser.add_argument("--lr", type=float, default=0.02, help="Muon LR")
+#     parser.add_argument("--adam_lr", type=float, default=0.003, help="AdamW LR")
+#     parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay (start with 0)")
+    
+#     args = parser.parse_args()
+
+#     # Create experiment directory structure
+#     exp_base_dir = os.path.join(args.exp_dir, args.name)
+#     checkpoint_dir = os.path.join(exp_base_dir, "checkpoints")
+#     os.makedirs(checkpoint_dir, exist_ok=True)
+
+#     # 1. Model Configuration
+#     model_config = llm.GPTConfig(
+#         num_layers=args.num_layers,
+#         hidden_size=args.hidden_size,
+#         ffn_hidden_size=args.hidden_size * 4,
+#         num_attention_heads=args.num_attention_heads,
+#         seq_length=args.seq_length,
+#     )
+
+#     # 2. Define FIXED Optimizer
+#     optimizer_arg = MuonOptimizerModule(
+#         lr=args.lr,
+#         adam_w_lr=args.adam_lr,
+#         weight_decay=args.weight_decay
+#     )
+
+#     tokenizer = AutoTokenizer(pretrained_model_name="gpt2")
+    
+#     # 3. Create Model
+#     model = llm.GPTModel(
+#         config=model_config, 
+#         tokenizer=tokenizer,
+#         optim=optimizer_arg
+#     )
+
+#     # 4. Data Module
+#     data = PreTrainingDataModule(
+#         paths={
+#             "train": [1.0, "data/wikitext103/my_gpt_data_text_document_text_document"],
+#             "validation": ["data/wikitext103/my_gpt_data_text_document_text_document"],
+#             "test": ["data/wikitext103/my_gpt_data_text_document_text_document"],
+#         },
+#         global_batch_size=args.global_batch_size,
+#         micro_batch_size=args.micro_batch_size,
+#         seq_length=args.seq_length,
+#         tokenizer=tokenizer,
+#         num_workers=8,
+#         pin_memory=True,
+#     )
+
+#     # 5. Strategy
+#     strategy = nl.MegatronStrategy(
+#         tensor_model_parallel_size=1,
+#         pipeline_model_parallel_size=1,
+#         pipeline_dtype=torch.bfloat16,
+#         ddp="megatron",
+#         find_unused_parameters=False,
+#         use_distributed_optimizer=False,
+#         save_sharded_state_dict=False,
+#     )
+
+#     # 6. Loggers
+#     loggers = []
+#     if args.enable_wandb:
+#         wandb_logger = WandbLogger(
+#             name=args.name,
+#             project=args.wandb_project,
+#             offline=args.wandb_offline,
+#             save_dir=exp_base_dir,
+#         )
+#         loggers.append(wandb_logger)
+
+#     # 7. Callbacks
+#     checkpoint_callback = ModelCheckpoint(
+#         dirpath=checkpoint_dir,
+#         filename="model-{step}-{reduced_train_loss:.4f}",
+#         monitor="reduced_train_loss",
+#         mode="min",
+#         save_last=True,
+#         save_top_k=3,
+#         every_n_train_steps=50,
+#         save_weights_only=True,
+#     )
+
+#     # 8. Trainer
+#     trainer = nl.Trainer(
+#         devices=args.num_gpus_per_node,
+#         num_nodes=args.num_nodes,
+#         max_steps=args.max_steps,
+#         accelerator="gpu",
+#         strategy=strategy,
+#         precision="bf16-mixed",
+#         log_every_n_steps=1,  # Log every step to see progress
+#         limit_val_batches=0,
+#         num_sanity_val_steps=0,
+#         logger=loggers if loggers else None,
+#         callbacks=[
+#             checkpoint_callback, 
+#             PerplexityCallback(), 
+#             OptimizerDiagnosticCallback()
+#         ],
+#         gradient_clip_val=1.0,
+#     )
+
+#     # 9. Train
+#     print(f"\n{'='*70}")
+#     print(f"[START] COMPLETELY REWRITTEN Muon Training")
+#     print(f"  Muon LR: {args.lr}")
+#     print(f"  AdamW LR: {args.adam_lr}")
+#     print(f"  Weight Decay: {args.weight_decay}")
+#     print(f"  Precision: bf16-mixed")
+#     print(f"  Gradient Clip: 1.0")
+#     print(f"  Max Steps: {args.max_steps}")
+#     print(f"{'='*70}\n")
+    
+#     llm.train(
+#         model=model,
+#         data=data,
+#         trainer=trainer,
+#         log=None,
+#         optim=None,
+#         resume=nl.AutoResume(resume_if_exists=False),
+#     )
+
+#     print("\n[TRAINING COMPLETE]\n")
+
+# if __name__ == "__main__":
+#     main()
+
 import math
 import argparse
 import os
 import torch
 from torch.optim.optimizer import Optimizer
-import torch.optim as optim
 
 # --- Standard NeMo Imports ---
 from nemo import lightning as nl
@@ -240,9 +699,9 @@ class PerplexityCallback(Callback):
             pl_module.log("train_perplexity", ppl, prog_bar=True, on_step=True, on_epoch=False)
 
 # ============================================================================ #
-#                      Muon Optimizer Diagnostic Callback                      #
+#                           Diagnostic Callback                                #
 # ============================================================================ #
-class MuonOptimizerDiagnosticCallback(Callback):
+class OptimizerDiagnosticCallback(Callback):
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         if batch_idx == 0:
             for i, opt in enumerate(trainer.optimizers):
@@ -266,27 +725,6 @@ class MuonOptimizerDiagnosticCallback(Callback):
                     print(f"  Muon layers: {muon_count}")
                     print(f"  AdamW layers: {adamw_count}")
                     print(f"{'='*70}\n")
-
-# ============================================================================ #
-#                      Adam Optimizer Diagnostic Callback                      #
-# ============================================================================ #
-class AdamOptimizerDiagnosticCallback(Callback):
-    def on_train_start(self, trainer, pl_module):
-        for i, opt in enumerate(trainer.optimizers):
-            if hasattr(opt, 'param_groups'):
-                opt_name = opt.__class__.__name__
-                lr = opt.param_groups[0]['lr']
-                eps = opt.param_groups[0].get('eps', 'N/A')
-                print(f"\n{'='*70}")
-                print(f"[DIAGNOSTIC] Optimizer {i}:")
-                print(f"  Class: {opt_name}  <-- SHOULD BE 'AdamW'")
-                print(f"  LR: {lr}")
-                print(f"  Eps: {eps}")
-                print(f"{'='*70}\n")
-
-# ============================================================================ #
-#                       Muon Layer-Wise Diagnostic Callback                    #
-# ============================================================================ #
 class LayerWiseDiagnosticCallback(Callback):
     """
     Prints exactly which optimizer (Muon or AdamW) is assigned to each named parameter.
@@ -325,13 +763,36 @@ class LayerWiseDiagnosticCallback(Callback):
         print("-" * 100)
         print(f"SUMMARY: Muon Layers: {muon_count} | AdamW Layers: {adam_count}")
         print(f"{'='*100}\n")
+# ============================================================================ #
+#                                Main Function                                 #
+# ============================================================================ #
+def main():
+    parser = argparse.ArgumentParser(description="NeMo GPT Pretraining with Muon")
+    parser.add_argument("--name", type=str, default="gpt_muon_fixed", help="Experiment name")
+    parser.add_argument("--exp_dir", type=str, default="experiments", help="Experiments directory")
+    parser.add_argument("--wandb_project", type=str, default="nemo-gpt-muon", help="WandB Project")
+    parser.add_argument("--wandb_offline", action="store_true", help="Run WandB offline")
+    parser.add_argument("--enable_wandb", action="store_true", default=True)
+    
+    # Training Config
+    parser.add_argument("--num_nodes", type=int, default=1)
+    parser.add_argument("--num_gpus_per_node", type=int, default=2)
+    parser.add_argument("--num_layers", type=int, default=12)
+    parser.add_argument("--hidden_size", type=int, default=768)
+    parser.add_argument("--num_attention_heads", type=int, default=12)
+    parser.add_argument("--seq_length", type=int, default=2048)
+    parser.add_argument("--max_steps", type=int, default=5)
+    parser.add_argument("--global_batch_size", type=int, default=16)
+    parser.add_argument("--micro_batch_size", type=int, default=1)
+    
+    # Optimizer Config
+    parser.add_argument("--lr", type=float, default=0.0001, help="Muon LR")
+    parser.add_argument("--adam_lr", type=float, default=0.003, help="AdamW LR")
+    parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay")
+    
+    args = parser.parse_args()
 
-# ============================================================================ #
-#                             Training Function                                #
-# ============================================================================ #
-def run_training(optim_type: str, args):
-    exp_name = f"{args.name}_{optim_type}"
-    exp_base_dir = os.path.join(args.exp_dir, exp_name)
+    exp_base_dir = os.path.join(args.exp_dir, args.name)
     checkpoint_dir = os.path.join(exp_base_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -341,46 +802,20 @@ def run_training(optim_type: str, args):
         ffn_hidden_size=args.hidden_size * 4,
         num_attention_heads=args.num_attention_heads,
         seq_length=args.seq_length,
-        init_method_std=0.023,
-        hidden_dropout=0.1,
-        attention_dropout=0.1,
-        layernorm_epsilon=1e-5,
-        make_vocab_size_divisible_by=128,
+    )
+
+    optimizer_arg = MuonOptimizerModule(
+        lr=args.lr,
+        adam_w_lr=args.adam_lr,
+        weight_decay=args.weight_decay
     )
 
     tokenizer = AutoTokenizer(pretrained_model_name="gpt2")
-
-    # 1. Initialize the optimizer module ONLY for muon
-    optim_module = None
-    if optim_type == "muon":
-        optim_module = MuonOptimizerModule(
-            lr=args.muon_lr,
-            adam_w_lr=args.adamw_lr,
-            weight_decay=args.weight_decay
-        )
-        callbacks = [
-            PerplexityCallback(), 
-            MuonOptimizerDiagnosticCallback(),
-            LayerWiseDiagnosticCallback()
-        ]
-        print(f"\n{'='*70}")
-        print(f"[START] Muon Training (Custom Optimizer)")
-        print(f"{'='*70}\n")
-    else:  # adam
-        # No optim_module assigned here so NeMo uses its default
-        callbacks = [
-            PerplexityCallback(),
-            AdamOptimizerDiagnosticCallback()
-        ]
-        print(f"\n{'='*70}")
-        print(f"[START] AdamW Training (NeMo Default Optimizer)")
-        print(f"{'='*70}\n")
-
-    # 2. Pass the optim_module to the model (it will be None for Adam)
+    
     model = llm.GPTModel(
         config=model_config, 
         tokenizer=tokenizer,
-        optim=optim_module  # When None, NeMo defaults to its internal AdamW
+        optim=optimizer_arg
     )
 
     data = PreTrainingDataModule(
@@ -401,7 +836,7 @@ def run_training(optim_type: str, args):
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
         pipeline_dtype=torch.bfloat16,
-        ddp="megatron",  
+        ddp="megatron",  # <--- 'megatron' for MegatronStrategy
         find_unused_parameters=False,
         use_distributed_optimizer=False,
     )
@@ -409,9 +844,8 @@ def run_training(optim_type: str, args):
     loggers = []
     if args.enable_wandb:
         wandb_logger = WandbLogger(
-            name=exp_name,
+            name=args.name,
             project=args.wandb_project,
-            entity=args.wandb_entity,
             offline=args.wandb_offline,
             save_dir=exp_base_dir,
         )
@@ -423,12 +857,10 @@ def run_training(optim_type: str, args):
         monitor="reduced_train_loss",
         mode="min",
         save_last=True,
-        save_top_k=1,
-        every_n_train_steps=100,
+        save_top_k=3,
+        every_n_train_steps=50,
         save_weights_only=True,
     )
-
-    callbacks.append(checkpoint_callback)
 
     trainer = nl.Trainer(
         devices=args.num_gpus_per_node,
@@ -441,10 +873,19 @@ def run_training(optim_type: str, args):
         limit_val_batches=0,
         num_sanity_val_steps=0,
         logger=loggers if loggers else None,
-        callbacks=callbacks,
+        callbacks=[
+            checkpoint_callback, 
+            PerplexityCallback(), 
+            OptimizerDiagnosticCallback(),
+            LayerWiseDiagnosticCallback()
+        ],
         gradient_clip_val=1.0,
     )
 
+    print(f"\n{'='*70}")
+    print(f"[START] Muon Training (Corrected DDP='megatron')")
+    print(f"{'='*70}\n")
+    
     llm.train(
         model=model,
         data=data,
@@ -453,63 +894,6 @@ def run_training(optim_type: str, args):
         optim=None,
         resume=nl.AutoResume(resume_if_exists=False),
     )
-
-    # Post-training: Access saved checkpoints
-    print(f"\n{'='*70}")
-    print(f"[TRAINING COMPLETE: {optim_type.upper()}]")
-    print(f"{'='*70}")
-    print(f"\n[CHECKPOINTS SAVED TO]: {os.path.abspath(checkpoint_dir)}\n")
-    
-    if hasattr(checkpoint_callback, 'best_model_path'):
-        print(f"[BEST MODEL]: {checkpoint_callback.best_model_path}\n")
-    
-    # List all checkpoints
-    if os.path.exists(checkpoint_dir):
-        checkpoints = [f for f in os.listdir(checkpoint_dir) if f.endswith('.ckpt')]
-        print(f"[CHECKPOINTS FOUND]: {len(checkpoints)}")
-        for ckpt in sorted(checkpoints):
-            ckpt_path = os.path.join(checkpoint_dir, ckpt)
-            print(f"  - {ckpt} ({os.path.getsize(ckpt_path) / 1e9:.2f} GB)")
-
-# ============================================================================ #
-#                                Main Function                                 #
-# ============================================================================ #
-def main():
-    parser = argparse.ArgumentParser(description="NeMo GPT Pretraining with Muon and AdamW")
-    parser.add_argument("--name", type=str, default="gpt_optim_comparison", help="Experiment name")
-    parser.add_argument("--exp_dir", type=str, default="experiments", help="Experiments directory")
-    parser.add_argument("--wandb_project", type=str, default="nemo-gpt-optim-comparison", help="WandB Project")
-    parser.add_argument("--wandb_entity", type=str, default=None, help="WandB Entity (User/Team)")
-    parser.add_argument("--wandb_offline", action="store_true", help="Run WandB offline")
-    parser.add_argument("--enable_wandb", action="store_true", default=True)
-    
-    # Training Config
-    parser.add_argument("--num_nodes", type=int, default=1)
-    parser.add_argument("--num_gpus_per_node", type=int, default=2)
-    parser.add_argument("--num_layers", type=int, default=12)
-    parser.add_argument("--hidden_size", type=int, default=768)
-    parser.add_argument("--num_attention_heads", type=int, default=12)
-    parser.add_argument("--seq_length", type=int, default=2048)
-    parser.add_argument("--max_steps", type=int, default=15)
-    parser.add_argument("--global_batch_size", type=int, default=16)
-    parser.add_argument("--micro_batch_size", type=int, default=1)
-    
-    # Optimizer Config
-    parser.add_argument("--optimizer", type=str, default="both", choices=["muon", "adam", "both"], help="Optimizer to use: muon (hybrid), adam (pure AdamW), or both")
-    parser.add_argument("--muon_lr", type=float, default=0.02, help="Muon LR for hybrid")
-    parser.add_argument("--adamw_lr", type=float, default=0.003, help="AdamW LR for hybrid aux params")
-    parser.add_argument("--pure_adam_lr", type=float, default=0.001, help="LR for pure AdamW")
-    parser.add_argument("--beta1", type=float, default=0.9, help="Beta1 for AdamW")
-    parser.add_argument("--beta2", type=float, default=0.999, help="Beta2 for AdamW")
-    parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay")
-    
-    args = parser.parse_args()
-
-    if args.optimizer in ["both", "muon"]:
-        run_training("muon", args)
-    
-    if args.optimizer in ["both", "adam"]:
-        run_training("adam", args)
 
 if __name__ == "__main__":
     main()
