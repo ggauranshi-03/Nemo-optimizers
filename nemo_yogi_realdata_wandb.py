@@ -12,7 +12,7 @@ from nemo import lightning as nl
 from nemo.collections import llm
 from nemo.collections.common.tokenizers.huggingface.auto_tokenizer import AutoTokenizer
 from nemo.collections.llm.gpt.data import PreTrainingDataModule
-
+from nemo.lightning.pytorch.optim import OptimizerModule
 # --- REAL IMPORTS from PyTorch Lightning ---
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import ModelCheckpoint, Callback
@@ -46,7 +46,7 @@ class Yogi(Optimizer):
         params,
         lr: float = 1e-2,
         betas: tuple = (0.9, 0.999),
-        eps: float = 1e-3,
+        eps: float = 1e-8,
         weight_decay: float = 0.0,
     ):
         if lr < 0.0:
@@ -61,6 +61,59 @@ class Yogi(Optimizer):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super(Yogi, self).__init__(params, defaults)
 
+    # @torch.no_grad()
+    # def step(self, closure=None):
+    #     loss = None
+    #     if closure is not None:
+    #         with torch.enable_grad():
+    #             loss = closure()
+
+    #     for group in self.param_groups:
+    #         beta1, beta2 = group["betas"]
+    #         eps = group["eps"]
+
+    #         for p in group["params"]:
+    #             if p.grad is None:
+    #                 continue
+
+    #             grad = p.grad.detach().float()
+    #             if grad.is_sparse:
+    #                 raise RuntimeError("Yogi does not support sparse gradients")
+
+    #             state = self.state[p]
+
+    #             if len(state) == 0:
+    #                 state["step"] = 0
+    #                 state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
+    #                 # state["exp_avg_sq"] = torch.full_like(p, fill_value=1e-6, dtype=torch.float32)
+    #                 state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
+
+    #             exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+    #             state["step"] += 1
+
+    #             p_data_fp32 = p.data.float()
+    #             if group["weight_decay"] != 0:
+    #                 grad = grad.add(p_data_fp32, alpha=group["weight_decay"])
+
+    #             exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+
+    #             grad_sq = grad.mul(grad)
+    #             exp_avg_sq.addcmul_(
+    #                 torch.sign(exp_avg_sq - grad_sq),
+    #                 grad_sq,
+    #                 value=-(1 - beta2),
+    #             )
+
+    #             bias_correction1 = 1.0 - beta1 ** state["step"]
+    #             bias_correction2 = 1.0 - beta2 ** state["step"]
+
+    #             denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
+    #             step_size = group["lr"] / bias_correction1
+
+    #             p_data_fp32.addcdiv_(exp_avg, denom, value=-step_size)
+    #             p.data.copy_(p_data_fp32.to(p.data.dtype))
+
+    #     return loss
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -71,50 +124,100 @@ class Yogi(Optimizer):
         for group in self.param_groups:
             beta1, beta2 = group["betas"]
             eps = group["eps"]
+            wd = group["weight_decay"]
+            lr = group["lr"]
 
             for p in group["params"]:
-                if p.grad is None:
+                # --- 1. ACCESS GRADIENT (MEGATRON COMPATIBLE) ---
+                grad = p.grad if p.grad is not None else getattr(p, 'main_grad', None)
+                if grad is None:
                     continue
-
-                grad = p.grad.detach().float()
-                if grad.is_sparse:
-                    raise RuntimeError("Yogi does not support sparse gradients")
 
                 state = self.state[p]
 
+                # --- 2. INITIALIZE STATE (ONLY ONCE) ---
+                # We use float32 for states to maintain precision
                 if len(state) == 0:
                     state["step"] = 0
                     state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
-                    state["exp_avg_sq"] = torch.full_like(p, fill_value=1e-6, dtype=torch.float32)
+                    state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
 
-                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+                exp_avg = state["exp_avg"]
+                exp_avg_sq = state["exp_avg_sq"]
                 state["step"] += 1
 
-                p_data_fp32 = p.data.float()
-                if group["weight_decay"] != 0:
-                    grad = grad.add(p_data_fp32, alpha=group["weight_decay"])
+                # --- 3. APPLY WEIGHT DECAY ---
+                # We use a temporary variable 'g' to avoid modifying the original grad buffer
+                if wd != 0:
+                    g = grad.add(p, alpha=wd)
+                else:
+                    g = grad
 
-                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                # --- 4. UPDATE MOMENTS (IN-PLACE TO SAVE MEMORY) ---
+                # exp_avg = beta1 * exp_avg + (1 - beta1) * g
+                exp_avg.mul_(beta1).add_(g, alpha=1 - beta1)
 
-                grad_sq = grad.mul(grad)
+                # Yogi Update Logic:
+                # v = v - (1-beta2) * sign(v - g^2) * g^2
+                # We compute g^2 once to save memory
+                g2 = g.pow(2)
+                
+                # We need sign(exp_avg_sq - g2). We compute this carefully.
+                # To save memory, we don't store the whole 'diff' tensor.
                 exp_avg_sq.addcmul_(
-                    torch.sign(exp_avg_sq - grad_sq),
-                    grad_sq,
-                    value=-(1 - beta2),
+                    (exp_avg_sq - g2).sign_(), 
+                    g2, 
+                    value=-(1 - beta2)
                 )
 
+                # --- 5. COMPUTE DENOMINATOR & UPDATE WEIGHTS ---
                 bias_correction1 = 1.0 - beta1 ** state["step"]
                 bias_correction2 = 1.0 - beta2 ** state["step"]
-
+                
+                # step_size = lr / bias_correction1
+                # denom = sqrt(exp_avg_sq / bias_correction2) + eps
+                
+                curr_lr = lr / bias_correction1
                 denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
-                step_size = group["lr"] / bias_correction1
 
-                p_data_fp32.addcdiv_(exp_avg, denom, value=-step_size)
-                p.data.copy_(p_data_fp32.to(p.data.dtype))
+                # Final update: p = p - curr_lr * (exp_avg / denom)
+                # addcdiv_ is highly memory efficient for this
+                p.addcdiv_(exp_avg, denom, value=-curr_lr)
+
+                # Cleanup large temporary tensors for the next parameter
+                if wd != 0: del g
+                del g2
 
         return loss
+# ============================================================================ #
+#                           Yogi Module Wrapper                                #
+# ============================================================================ #
+class YogiOptimizerModule(OptimizerModule):
+    """
+    Wraps the custom Yogi optimizer to make it compatible with NeMo's
+    OptimizerModule interface.
+    """
+    def __init__(self, lr: float, betas: tuple, weight_decay: float, lr_scheduler=None):
+        super().__init__(lr_scheduler=lr_scheduler)
+        
+        # FIX 1: Add the missing config attribute to satisfy NeMo checks
+        self.config = None 
+        
+        self.lr = lr
+        self.betas = betas
+        self.weight_decay = weight_decay
 
-
+    def optimizers(self, model):
+        """
+        This method is called by NeMo to instantiate the actual optimizer.
+        """
+        # FIX 2: Return a LIST of optimizers [ ... ], not a single object
+        return [Yogi(
+            model.parameters(),
+            lr=self.lr,
+            betas=self.betas,
+            weight_decay=self.weight_decay
+        )]
 # ============================================================================ #
 #              DIAGNOSTIC CALLBACK - Verify Optimizer is Yogi                #
 # ============================================================================ #
@@ -152,21 +255,21 @@ def main():
 
     # Training Config
     parser.add_argument("--num_nodes", type=int, default=1, help="Number of nodes")
-    parser.add_argument("--num_gpus_per_node", type=int, default=4, help="GPUs per node")
+    parser.add_argument("--num_gpus_per_node", type=int, default=2, help="GPUs per node")
     parser.add_argument("--num_layers", type=int, default=12, help="Number of layers")
     parser.add_argument("--hidden_size", type=int, default=768, help="Hidden size")
     parser.add_argument("--num_attention_heads", type=int, default=12, help="Attention heads")
     parser.add_argument("--seq_length", type=int, default=2048, help="Sequence length")
-    parser.add_argument("--max_steps", type=int, default=150, help="Max training steps")
-    parser.add_argument("--global_batch_size", type=int, default=32, help="Global batch size")
-    parser.add_argument("--micro_batch_size", type=int, default=4, help="Micro batch size")
+    parser.add_argument("--max_steps", type=int, default=5, help="Max training steps")
+    parser.add_argument("--global_batch_size", type=int, default=16, help="Global batch size")
+    parser.add_argument("--micro_batch_size", type=int, default=1, help="Micro batch size")
     
     # Optimizer Config
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--beta1", type=float, default=0.9, help="Beta1 for Yogi")
     parser.add_argument("--beta2", type=float, default=0.999, help="Beta2 for Yogi")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
-
+    parser.add_argument("--use_distributed_optimizer", action="store_true", default=False)
     args = parser.parse_args()
 
     print(f"\n{'='*70}")
@@ -200,18 +303,27 @@ def main():
         layernorm_epsilon=1e-5,
         make_vocab_size_divisible_by=128,
     )
+    optimizer_arg = YogiOptimizerModule(
+        lr=args.lr,
+        betas=(args.beta1, args.beta2),
+        weight_decay=args.weight_decay
+    )
     tokenizer = AutoTokenizer(pretrained_model_name="gpt2")
-    model = llm.GPTModel(config=model_config, tokenizer=tokenizer)
-
+    # model = llm.GPTModel(config=model_config, tokenizer=tokenizer)
+    model = llm.GPTModel(
+        config=model_config, 
+        tokenizer=tokenizer,
+        optim=optimizer_arg  # Inject it here
+    )
     # 2. Data Module
     data = PreTrainingDataModule(
         paths={
             "train": [
-                0.75, "data/wikitext103/my_gpt_data_text_document",
-                0.25, "data/wikitext103/my_gpt_data_text_document",
+                0.75, "data/wikitext103/my_gpt_data_text_document_text_document",
+                0.25, "data/wikitext103/my_gpt_data_text_document_text_document",
             ],
-            "validation": ["data/wikitext103/my_gpt_data_text_document"],
-            "test": ["data/wikitext103/my_gpt_data_text_document"],
+            "validation": ["data/wikitext103/my_gpt_data_text_document_text_document"],
+            "test": ["data/wikitext103/my_gpt_data_text_document_text_document"],
         },
         global_batch_size=args.global_batch_size,
         micro_batch_size=args.micro_batch_size,
@@ -274,7 +386,7 @@ def main():
         max_steps=args.max_steps,
         accelerator="gpu",
         strategy=strategy,
-        precision="bf16-mixed",
+        precision="32",
         log_every_n_steps=10,
         limit_val_batches=0,
         num_sanity_val_steps=0,
@@ -292,18 +404,10 @@ def main():
     # ====================================================================== #
     # CRITICAL FIX: Override trainer's optimizer_class BEFORE training       #
     # ====================================================================== #
-    def create_yogi_optimizer(param_groups):
-        """Factory function NeMo will call to create the optimizer"""
-        return Yogi(
-            param_groups,
-            lr=args.lr,
-            betas=(args.beta1, args.beta2),
-            eps=1e-3,
-            weight_decay=args.weight_decay,
-        )
+
     
-    trainer._optimizer_class = Yogi
-    print("[TRAINER] Set trainer._optimizer_class = Yogi\n")
+    # trainer._optimizer_class = Yogi
+    # print("[TRAINER] Set trainer._optimizer_class = Yogi\n")
 
     # 8. Train
     print(f"\n{'='*70}")
