@@ -2,8 +2,6 @@ import math
 import argparse
 import os
 import torch
-import torch.distributed as dist
-from torch import Tensor
 from torch.optim.optimizer import Optimizer
 
 # --- Standard NeMo Imports ---
@@ -18,87 +16,71 @@ from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import ModelCheckpoint, Callback
 
 # ============================================================================ #
-#                           Fixed AdaMuon Math Helper                          #
+#                           Muon Math Helper Functions                         #
 # ============================================================================ #
-def orthogonalize_via_newtonschulz(G: Tensor, steps: int = 5, eps: float = 1e-7) -> Tensor:
+def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
     """
-    Newton-Schulz iteration to compute orthogonalization of gradient matrix.
-    This is the FIXED version that preserves gradient information.
+    Newton-Schulz iteration to compute the zero-power / orthogonalization.
     """
     assert G.ndim == 2, f"Expected 2D tensor, got {G.ndim}D"
     
     a, b, c = (3.4445, -4.7750, 2.0315)
     
-    # Save original shape for later
-    original_rows, original_cols = G.shape
-    
-    # Transpose if needed for better conditioning
-    if original_rows > original_cols:
+    if G.size(0) > G.size(1):
         G = G.t()
         transposed = True
-        rows, cols = G.shape
     else:
         transposed = False
-        rows, cols = G.shape
     
-    # Initialize with normalized gradient (preserves gradient direction)
     norm = G.norm() + eps
     X = G / norm
     X = X.bfloat16()
     
-    # Newton-Schulz iteration for orthogonalization
     for _ in range(steps):
         A = X.t() @ X
         B = b * A + c * A @ A
-        X = X @ (a * torch.eye(cols, device=X.device, dtype=X.dtype) + B)
-    
-    # Scale by original gradient norm to preserve magnitude information
-    X = X.float() * norm
+        X = X @ (a * torch.eye(X.size(1), device=X.device, dtype=X.dtype) + B)
     
     if transposed:
         X = X.t()
     
-    # Restore to original dimensions if needed
-    if X.shape != (original_rows, original_cols):
-        X = X.view(original_rows, original_cols)
-    
-    return X
+    return X.float()
 
 # ============================================================================ #
-#                           Fixed AdaMuon Class                                #
+#                            Hybrid Muon Optimizer                             #
 # ============================================================================ #
+
 class AdaMuon(Optimizer):
-    """
-    FIXED AdaMuon: Adaptive Muon Optimizer
-    Fixed the critical issue: Preserves gradient information instead of using sign(g)
-    """
-    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, nesterov=True, 
-                 ns_steps=5, eps=1e-8, rank=None, world_size=None):
-        
-        if (rank is None) or (world_size is None):
-            raise Exception("world_size and rank params required. For single GPU pass rank=0 and world_size=1.")
-        
-        self.rank = rank
-        self.world_size = world_size
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, 
-                       nesterov=nesterov, ns_steps=ns_steps, eps=eps)
-        
-        # Group parameters by size for efficient distributed updates
-        params = list(params)
-        param_groups = []
-        
-        for size in {p.numel() for p in params}:
-            buf = torch.empty(world_size, size, dtype=torch.bfloat16, device="cuda")
-            group = dict(
-                params=[p for p in params if p.numel() == size],
-                update_buffer=buf, 
-                update_buffer_views=[buf[i] for i in range(world_size)])
-            param_groups.append(group)
-        
-        super().__init__(param_groups, defaults)
-        
-        self.log_interval = 10
-    
+    def __init__(
+        self,
+        params,
+        lr: float = 0.02,              
+        betas: tuple = (0.9, 0.95),      # <--- CHANGE: AdaMuon uses betas, not simple momentum
+        ns_steps: int = 5,
+        adam_w_lr: float = 0.003,       
+        adam_w_betas: tuple = (0.9, 0.999),
+        weight_decay: float = 0.0,
+        eps: float = 1e-8,
+    ):
+        defaults = dict(
+            lr=lr, 
+            betas=betas,                # Store Muon-specific betas
+            ns_steps=ns_steps,
+            adam_w_lr=adam_w_lr,
+            adam_w_betas=adam_w_betas,
+            weight_decay=weight_decay,
+            eps=eps
+        )
+        super().__init__(params, defaults)
+        self.log_interval = 10 
+
+    def _classify_param(self, p):
+        # Same classification logic as before
+        is_embedding = (p.ndim == 2 and p.size(0) > 10000)
+        is_norm_or_bias = (p.ndim < 2)
+        is_linear_weight = (p.ndim == 2 and not is_embedding)
+        return is_linear_weight
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -106,198 +88,151 @@ class AdaMuon(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        muon_updates = 0
+        adam_updates = 0
+        skipped = 0
+
         for group in self.param_groups:
-            update_buffer: Tensor = group["update_buffer"]
-            update_buffer_views: list[Tensor] = group["update_buffer_views"]
-            params: list[Tensor] = group["params"]
-            eps = group["eps"]
-            handle = None
-            params_world = None
+            # Common params
+            lr = group['lr']
+            weight_decay = group['weight_decay']
+            
+            # Muon params
+            muon_beta1, muon_beta2 = group['betas']
+            ns_steps = group['ns_steps']
+            
+            # AdamW params
+            adam_lr = group['adam_w_lr']
+            adam_beta1, adam_beta2 = group['adam_w_betas']
+            eps = group['eps']
 
-            def update_prev():
-                handle.wait()
-                for p_world, g_world in zip(params_world, update_buffer_views):
-                    p_world.mul_(1 - group["lr"] * group["weight_decay"])
-                    p_world.add_(g_world.view_as(p_world), alpha=-group["lr"])
+            for p in group['params']:
+                grad = p.grad
+                if grad is None and hasattr(p, 'main_grad'):
+                    grad = p.main_grad
+                if grad is None:
+                    skipped += 1
+                    continue
+                
+                state = self.state[p]
 
-            # AdaMuon Distributed Sharding Logic
-            for base_i in range(len(params))[::self.world_size]:
-                if base_i + self.rank < len(params):
-                    p = params[base_i + self.rank]
+                # Initialize state
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['use_muon'] = self._classify_param(p)
+                    state['exp_avg'] = torch.zeros_like(p)
+                    state['exp_avg_sq'] = torch.zeros_like(p)
 
-                    # Handle gradient from Megatron
-                    g = p.grad
-                    if g is None and hasattr(p, 'main_grad'):
-                        g = p.main_grad
-                    if g is None:
-                        g = torch.zeros_like(p)
+                state['step'] += 1
+                use_muon = state['use_muon']
+                exp_avg = state['exp_avg']
+                exp_avg_sq = state['exp_avg_sq']
+                step_t = state['step']
 
-                    state = self.state[p]
+                if use_muon:
 
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-
-                    if "step" not in state:
-                        state["step"] = 0
-                    state["step"] += 1
-
-                    buf: Tensor = state["momentum_buffer"]
-
-                    # Momentum update
-                    buf.mul_(group["momentum"]).add_(g, alpha=1 - group["momentum"])
-
-                    # Nesterov momentum if enabled
-                    if group['nesterov']:
-                        g = g.add(buf, alpha=group["momentum"])
-                    else:
-                        g = buf
-
-                    # FIXED: Apply Newton-Schulz orthogonalization to the GRADIENT
-                    # Reshape for matrix operations if needed
-                    original_shape = g.shape
-                    if g.ndim > 2:
-                        g_reshaped = g.view(g.size(0), -1)
-                    else:
-                        g_reshaped = g
-
-                    # Apply orthogonalization to gradient
-                    g_ortho = orthogonalize_via_newtonschulz(g_reshaped, steps=group["ns_steps"])
-
-                    # Reshape back to original shape
-                    if g.ndim > 2:
-                        g_ortho = g_ortho.view(original_shape)
-
-                    # Adaptive scaling
-                    rows, cols = (p.shape[0], p.shape[1]) if p.ndim >= 2 else (1, p.numel())
-                    scale = max(1, rows / cols) ** 0.5
-                    g_ortho.mul_(scale)
-
-                    # Convert to buffer dtype
-                    g = g_ortho.to(update_buffer.dtype)
-
-                    # CRITICAL FIX: Ensure tensor is contiguous before all_gather
-                    g = g.contiguous()
+                    muon_updates += 1
+                    
+                    # 1. Update Momentum (M_t)
+                    # M_t = beta * M_{t-1} + (1-beta) * G_t
+                    exp_avg.mul_(muon_beta1).add_(grad, alpha=1 - muon_beta1)
+                    
+                    # 2. Orthogonalize Momentum (O_t)
+                    # Note: Algorithm runs NS on M_t directly
+                    M_t = exp_avg
+                    O_t = zeropower_via_newtonschulz5(M_t, steps=ns_steps)
+                    
+                    # 3. Update Second Moment (v_t) using Orthogonalized Direction
+                    # v_t = beta2 * v_{t-1} + (1-beta2) * O_t^2  <--- CRITICAL CHANGE
+                    # Algorithm uses element-wise squaring of O_t
+                    exp_avg_sq.mul_(muon_beta2).addcmul_(O_t, O_t, value=1 - muon_beta2)
+                    
+                    # 4. Adaptive Update (O_hat)
+                    # v_hat = v_t / (1 - beta2^t)
+                    # o_hat = O_t / (sqrt(v_hat) + eps)
+                    bias_correction2 = 1 - muon_beta2 ** step_t
+                    v_hat = exp_avg_sq / bias_correction2
+                    denom = v_hat.sqrt().add_(eps)
+                    O_hat = O_t / denom
+                    
+                    # 5. RMS-aligned Rescaling
+                    # scaling_factor = 0.2 / (RMS(O_hat) + eps)
+                    # RMS = sqrt(mean(square(x)))
+                    rms = O_hat.pow(2).mean().sqrt()
+                    scaling_factor = 0.2 / (rms + eps)
+                    
+                    # 6. Apply Update with Weight Decay
+                    # W_{t+1} = W_t - lr * (scaling_factor * O_hat + lambda * W_t)
+                    
+                    # Calculate the full update term: (scale * O_hat + wd * W)
+                    update_term = O_hat.mul_(scaling_factor)
+                    if weight_decay != 0:
+                        update_term.add_(p, alpha=weight_decay)
+                        
+                    p.add_(update_term, alpha=-lr)
 
                 else:
-                    g = update_buffer_views[self.rank]
+                    # ================================================================= #
+                    #                  Standard AdamW (Auxiliary)                      #
+                    # ================================================================= #
+                    adam_updates += 1
+                    
+                    # Standard Weight Decay (Decoupled)
+                    if weight_decay != 0:
+                        p.mul_(1 - adam_lr * weight_decay)
 
-                if base_i > 0:
-                    update_prev()
+                    # Update Moments
+                    exp_avg.mul_(adam_beta1).add_(grad, alpha=1 - adam_beta1)
+                    exp_avg_sq.mul_(adam_beta2).addcmul_(grad, grad, value=1 - adam_beta2)
+                    
+                    bias_correction1 = 1 - adam_beta1 ** step_t
+                    bias_correction2 = 1 - adam_beta2 ** step_t
+                    
+                    step_size = adam_lr / bias_correction1
+                    bias_correction2_sqrt = math.sqrt(bias_correction2)
+                    
+                    denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
+                    p.addcdiv_(exp_avg, denom, value=-step_size)
 
-                # CRITICAL FIX: Flatten g before all_gather and ensure it's contiguous
-                g_flat = g.flatten().contiguous()
+        # Logging (Unchanged)
+        step_count = 0
+        if len(self.param_groups) > 0 and len(self.param_groups[0]['params']) > 0:
+             p0 = self.param_groups[0]['params'][0]
+             if p0 in self.state:
+                 step_count = self.state[p0]['step']
 
-                handle = dist.all_gather_into_tensor(update_buffer, g_flat, async_op=True)
-                params_world = params[base_i : base_i + self.world_size]
-
-            if params: 
-                update_prev()
+        if step_count % self.log_interval == 0 or step_count == 1:
+            print(f"\n[OPTIMIZER CHECK step {step_count}]")
+            print(f"  > AdaMuon Updates (Strict Algo 1): {muon_updates}")
+            print(f"  > AdamW Updates (Auxiliary):       {adam_updates}")
 
         return loss
 
 # ============================================================================ #
-#                           Hybrid Optimizer Wrapper                           #
+#                           Muon Module Wrapper                                #
 # ============================================================================ #
-class HybridOptimizer(Optimizer):
-    def __init__(self, optimizers):
-        self.optimizers = optimizers
-        self.param_groups = []
-        for opt in optimizers:
-            self.param_groups.extend(opt.param_groups)
-        defaults = optimizers[0].defaults if optimizers else {}
-        super().__init__(self.param_groups, defaults)
-
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            loss = closure()
-        for opt in self.optimizers:
-            opt.step()
-        return loss
-
-    def zero_grad(self, set_to_none=True):
-        for opt in self.optimizers:
-            opt.zero_grad(set_to_none=set_to_none)
-
-    def state_dict(self):
-        return {
-            'hybrid_optimizers': [opt.state_dict() for opt in self.optimizers],
-        }
-
-    def load_state_dict(self, state_dict):
-        if 'hybrid_optimizers' in state_dict:
-            opt_states = state_dict['hybrid_optimizers']
-            for opt, s_dict in zip(self.optimizers, opt_states):
-                opt.load_state_dict(s_dict)
-        else:
-            super().load_state_dict(state_dict)
-
-# ============================================================================ #
-#                           Optimizer Module Wrapper                           #
-# ============================================================================ #
-class AdaMuonOptimizerModule(OptimizerModule):
+class MuonOptimizerModule(OptimizerModule):
     def __init__(self, lr: float, adam_w_lr: float, weight_decay: float, lr_scheduler=None):
         super().__init__(lr_scheduler=lr_scheduler)
-        # Fix for NeMo Megatron Strategy check
         self.config = None 
-        
         self.lr = lr
         self.adam_w_lr = adam_w_lr
         self.weight_decay = weight_decay
 
     def optimizers(self, model):
-        params_dict = {n: p for n, p in model.named_parameters() if p.requires_grad}
-        
-        muon_params = []
-        decay_params = []
-        nodecay_params = []
-
-        for name, p in params_dict.items():
-            is_embedding = (p.ndim == 2 and p.size(0) > 10000)
-            is_linear_weight = (p.ndim >= 2 and not is_embedding)
-
-            if is_linear_weight:
-                muon_params.append(p)
-            elif p.ndim < 2:
-                nodecay_params.append(p)
-            else:
-                decay_params.append(p)
-
-        if dist.is_initialized():
-            rank = dist.get_rank()
-            world_size = dist.get_world_size()
-        else:
-            rank = 0
-            world_size = 1
-
-        optim_groups_adam = [
-            {'params': decay_params, 'weight_decay': self.weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        opt_adam = torch.optim.AdamW(optim_groups_adam, lr=self.adam_w_lr, betas=(0.9, 0.95))
-
-        opt_adamuon = AdaMuon(
-            muon_params, 
-            lr=self.lr, 
+        # Filter for parameters that actually require gradients
+        params = [p for p in model.parameters() if p.requires_grad]
+        return [AdaMuon(         
+            params,
+            lr=self.lr,
+            adam_w_lr=self.adam_w_lr,
             weight_decay=self.weight_decay,
-            momentum=0.95,
-            nesterov=True,
-            ns_steps=5,
-            rank=rank, 
-            world_size=world_size
-        )
-
-        print(f"\n{'='*70}")
-        print(f"Initialized FIXED Hybrid Optimizer:")
-        print(f"  > AdaMuon params: {len(muon_params)} tensors")
-        print(f"  > AdamW (Decay) params: {len(decay_params)} tensors")
-        print(f"  > AdamW (No Decay) params: {len(nodecay_params)} tensors")
-        print(f"{'='*70}")
-
-        return [HybridOptimizer([opt_adam, opt_adamuon])]
+            betas=(0.9, 0.95),   
+            ns_steps=5
+        )]
 
 # ============================================================================ #
-#                           Callbacks                                          #
+#                            Perplexity Callback                               #
 # ============================================================================ #
 class PerplexityCallback(Callback):
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
@@ -306,97 +241,103 @@ class PerplexityCallback(Callback):
             loss = outputs.get("loss") or outputs.get("reduced_train_loss")
         elif torch.is_tensor(outputs):
             loss = outputs
-
+        
         if loss is not None:
             ppl = torch.exp(loss.detach())
             pl_module.log("train_perplexity", ppl, prog_bar=True, on_step=True, on_epoch=False)
 
+# ============================================================================ #
+#                           Diagnostic Callback                                #
+# ============================================================================ #
 class OptimizerDiagnosticCallback(Callback):
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         if batch_idx == 0:
-            print(f"\n{'='*70}")
-            print(f"[OPTIMIZER DIAGNOSTIC]")
-            hybrid_opt = trainer.optimizers[0]
-            if isinstance(hybrid_opt, HybridOptimizer):
-                for i, opt in enumerate(hybrid_opt.optimizers):
-                    name = opt.__class__.__name__
-                    total_params = sum([len(g['params']) for g in opt.param_groups])
-                    print(f"  Internal Optimizer {i}: {name} (Tensors: {total_params})")
-            else:
-                print("  [WARNING] Optimizer is not HybridOptimizer instance.")
-            print(f"{'='*70}\n")
+            for i, opt in enumerate(trainer.optimizers):
+                if hasattr(opt, 'state'):
+                    muon_count = 0
+                    adamw_count = 0
+                    
+                    if len(opt.state) == 0:
+                        print(f"\n[DIAGNOSTIC CRITICAL] Optimizer {i} has EMPTY state after step 0!")
+                        print("This means p.grad (and p.main_grad) was None for all parameters.")
+                        continue
 
-class AdaMuonDebugCallback(Callback):
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        """Debug callback to monitor AdaMuon updates"""
-        if batch_idx % 10 == 0:
-            hybrid_opt = trainer.optimizers[0]
-            if isinstance(hybrid_opt, HybridOptimizer):
-                for i, opt in enumerate(hybrid_opt.optimizers):
-                    if isinstance(opt, AdaMuon):
-                        ada_muon_updates = 0
-                        ada_muon_norm = 0.0
-                        for group in opt.param_groups:
-                            for p in group['params']:
-                                state = opt.state[p]
-                                if 'step' in state and state['step'] > 0:
-                                    ada_muon_updates += 1
-                        print(f"[AdaMuon Debug] Steps: {batch_idx}, Updated tensors: {ada_muon_updates}")
-
+                    for param, s in opt.state.items():
+                        if s.get('use_muon', False):
+                            muon_count += 1
+                        else:
+                            adamw_count += 1
+                    
+                    print(f"\n{'='*70}")
+                    print(f"[PARAMETER CLASSIFICATION]")
+                    print(f"  Muon layers: {muon_count}")
+                    print(f"  AdamW layers: {adamw_count}")
+                    print(f"{'='*70}\n")
 class LayerWiseDiagnosticCallback(Callback):
+    """
+    Prints exactly which optimizer (Muon or AdamW) is assigned to each named parameter.
+    """
     def on_train_start(self, trainer, pl_module):
         print(f"\n{'='*100}")
         print(f"{'[LAYER-WISE OPTIMIZER ASSIGNMENT]':^100}")
         print(f"{'='*100}")
         print(f"{'PARAMETER NAME':<60} | {'SHAPE':<15} | {'ASSIGNED OPTIMIZER'}")
         print("-" * 100)
+
         muon_count = 0
         adam_count = 0
+
+        # Iterate over all named parameters in the model
         for name, param in pl_module.named_parameters():
             if not param.requires_grad:
                 continue
+
+            # --- REPLICATING MUON LOGIC ---
+            # 1. Embeddings (Large vocab size > 10,000 rows)
             is_embedding = (param.ndim == 2 and param.size(0) > 10000)
-            is_linear_weight = (param.ndim >= 2 and not is_embedding)
+            
+            # 2. Linear Weights (2D matrices that are NOT embeddings) -> Muon
+            is_linear_weight = (param.ndim == 2 and not is_embedding)
+
             if is_linear_weight:
-                optim_type = "AdaMuon (FIXED)"
+                optim_type = "ADAMUON"
                 muon_count += 1
             else:
-                optim_type = "AdamW"
+                optim_type = "ADAMW (Aux)"
                 adam_count += 1
-            print(f"{name:<60} | {str(list(param.shape)):<15} | {optim_type}")
-        print("-" * 100)
-        print(f"SUMMARY: AdaMuon Layers: {muon_count} | AdamW Layers: {adam_count}")
-        print(f"{'='*100}\n")
 
+            print(f"{name:<60} | {str(list(param.shape)):<15} | {optim_type}")
+
+        print("-" * 100)
+        print(f"SUMMARY: Muon Layers: {muon_count} | AdamW Layers: {adam_count}")
+        print(f"{'='*100}\n")
 # ============================================================================ #
-#                                 Main Function                                #
+#                                Main Function                                 #
 # ============================================================================ #
 def main():
-    parser = argparse.ArgumentParser(description="NeMo GPT Pretraining with FIXED AdaMuon")
+    parser = argparse.ArgumentParser(description="NeMo GPT Pretraining with Muon")
     parser.add_argument("--name", type=str, default="gpt_adamuon", help="Experiment name")
     parser.add_argument("--exp_dir", type=str, default="experiments", help="Experiments directory")
     parser.add_argument("--wandb_project", type=str, default="nemo-gpt-muon", help="WandB Project")
     parser.add_argument("--wandb_offline", action="store_true", help="Run WandB offline")
     parser.add_argument("--enable_wandb", action="store_true", default=True)
-
+    
     # Training Config
     parser.add_argument("--num_nodes", type=int, default=1)
     parser.add_argument("--num_gpus_per_node", type=int, default=2)
-    parser.add_argument("--num_layers", type=int, default=8)
-    parser.add_argument("--hidden_size", type=int, default=512)
-    parser.add_argument("--num_attention_heads", type=int, default=8)
-    parser.add_argument("--seq_length", type=int, default=1024)
-    parser.add_argument("--max_steps", type=int, default=100) 
-    
-    # Batch Size - divisible by GPU count
-    parser.add_argument("--global_batch_size", type=int, default=8)
+    parser.add_argument("--num_layers", type=int, default=12)
+    parser.add_argument("--hidden_size", type=int, default=768)
+    parser.add_argument("--num_attention_heads", type=int, default=12)
+    parser.add_argument("--seq_length", type=int, default=2048)
+    parser.add_argument("--max_steps", type=int, default=100)
+    parser.add_argument("--global_batch_size", type=int, default=16)
     parser.add_argument("--micro_batch_size", type=int, default=1)
-
-    # Optimizer Config - Adjusted learning rates
-    parser.add_argument("--lr", type=float, default=0.0003, help="AdaMuon LR")  # Reduced from 0.0006
+    
+    # Optimizer Config
+    parser.add_argument("--lr", type=float, default=0.0001, help="Muon LR")
     parser.add_argument("--adam_lr", type=float, default=0.003, help="AdamW LR")
-    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
-
+    parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay")
+    
     args = parser.parse_args()
 
     exp_base_dir = os.path.join(args.exp_dir, args.name)
@@ -411,16 +352,16 @@ def main():
         seq_length=args.seq_length,
     )
 
-    optimizer_arg = AdaMuonOptimizerModule(
+    optimizer_arg = MuonOptimizerModule(
         lr=args.lr,
         adam_w_lr=args.adam_lr,
         weight_decay=args.weight_decay
     )
 
     tokenizer = AutoTokenizer(pretrained_model_name="gpt2")
-
+    
     model = llm.GPTModel(
-        config=model_config,
+        config=model_config, 
         tokenizer=tokenizer,
         optim=optimizer_arg
     )
@@ -435,18 +376,17 @@ def main():
         micro_batch_size=args.micro_batch_size,
         seq_length=args.seq_length,
         tokenizer=tokenizer,
-        num_workers=2,
-        pin_memory=False,
+        num_workers=8,
+        pin_memory=True,
     )
 
     strategy = nl.MegatronStrategy(
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
         pipeline_dtype=torch.bfloat16,
-        ddp="megatron",  
+        ddp="megatron",  # <--- 'megatron' for MegatronStrategy
         find_unused_parameters=False,
-        use_distributed_optimizer=False, 
-        gradient_as_bucket_view=True,
+        use_distributed_optimizer=False,
     )
 
     loggers = []
@@ -482,25 +422,18 @@ def main():
         num_sanity_val_steps=0,
         logger=loggers if loggers else None,
         callbacks=[
-            checkpoint_callback,
-            PerplexityCallback(),
+            checkpoint_callback, 
+            PerplexityCallback(), 
             OptimizerDiagnosticCallback(),
-            AdaMuonDebugCallback(),
             LayerWiseDiagnosticCallback()
         ],
         gradient_clip_val=1.0,
     )
 
     print(f"\n{'='*70}")
-    print(f"[START] FIXED AdaMuon Training (Hybrid: Fixed AdaMuon + AdamW)")
-    print(f"Changes made:")
-    print(f"1. Removed torch.sign() - now using actual gradients")
-    print(f"2. Fixed Newton-Schulz to preserve gradient magnitude")
-    print(f"3. Added proper scaling")
-    print(f"4. Increased max_steps to {args.max_steps}")
-    print(f"5. Reduced AdaMuon LR to {args.lr}")
+    print(f"[START] Muon Training (Corrected DDP='megatron')")
     print(f"{'='*70}\n")
-
+    
     llm.train(
         model=model,
         data=data,
