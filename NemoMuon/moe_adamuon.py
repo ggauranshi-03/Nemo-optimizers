@@ -1,12 +1,14 @@
+//Adamuon_moe
+
+
 import math
 import argparse
 import os
 import torch
 from torch.optim.optimizer import Optimizer
-# This must happen BEFORE importing NeMo/Megatron
+
 import sys
 
-# Monkey patch the problematic module
 def patch_megatron_moe():
     """Patch Megatron-Core to handle missing Transformer Engine"""
     try:
@@ -303,7 +305,7 @@ def main():
     parser.add_argument("--global_batch_size", type=int, default=8)
     parser.add_argument("--micro_batch_size", type=int, default=1)
     
-    parser.add_argument("--lr", type=float, default=0.0001)
+    parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--adam_lr", type=float, default=0.003)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     
@@ -357,9 +359,9 @@ def main():
 
     data = PreTrainingDataModule(
         paths={
-           "train": [1.0, "data/wikitext103/my_gpt_data_text_document_text_document"],
-            "validation": ["data/wikitext103/my_gpt_data_text_document_text_document"],
-            "test": ["data/wikitext103/my_gpt_data_text_document_text_document"],
+            "train": [1.0, "data/wikitext103/my_gpt_data_text_document"],
+            "validation": ["data/wikitext103/my_gpt_data_text_document"],
+            "test": ["data/wikitext103/my_gpt_data_text_document"],
         },
         global_batch_size=args.global_batch_size,
         micro_batch_size=args.micro_batch_size,
