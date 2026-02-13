@@ -1,6 +1,3 @@
-//Adamuon_moe
-
-
 import math
 import argparse
 import os
